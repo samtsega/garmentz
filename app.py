@@ -10,6 +10,11 @@ from PIL import Image
 import logging
 import requests
 from functools import lru_cache
+import hashlib
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -25,39 +30,41 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 
-# Azure Container SAS URL (whole container) with read+write permissions
-AZURE_CONTAINER_SAS = (
-    "https://garmentzstorage.blob.core.windows.net/models"
-    "?sp=rw&st=2025-06-30T20:23:44Z&se=2026-06-30T04:23:44Z&spr=https&sv=2024-11-04&sr=c"
-    "&sig=pdXvYerBZoBVSW93Dwq665ZySH8W2wskaZkQAaKjkto%3D"
-)
+# eBay tokens from .env
+EBAY_VERIFICATION_TOKEN = os.getenv("EBAY_VERIFICATION_TOKEN")
+EBAY_ENDPOINT_SECRET = os.getenv("EBAY_ENDPOINT_SECRET")
 
-# Depreciation model URL (.h5 file with read access)
-DEPRECIATION_MODEL_URL = (
-    "https://garmentzstorage.blob.core.windows.net/models/depreciation_model.h5"
-    "?sp=cw&st=2025-06-30T20:15:40Z&se=2026-05-31T04:15:40Z&spr=https&sv=2024-11-04&sr=b"
-    "&sig=rRRvaPERXY1xmEKw3Nu5Nvd4D5ZCVnLjzteoQMenGwg%3D"
-)
+# Azure settings from .env
+AZURE_CONTAINER_URL = os.getenv("AZURE_CONTAINER_URL")
+AZURE_CONTAINER_SAS_TOKEN = os.getenv("AZURE_CONTAINER_SAS_TOKEN")
+DEPRECIATION_MODEL_URL = os.getenv("DEPRECIATION_MODEL_URL")
+WEAR_MODEL_URL = os.getenv("WEAR_MODEL_URL")
 
-# Load wear model (optional)
+# Load wear model
 try:
-    wear_model = load_model("models/wear_tear_model.h5")
+    wear_model_path = "models/wear_tear_model.h5"
+    os.makedirs("models", exist_ok=True)
+    if not os.path.exists(wear_model_path):
+        logger.info("Downloading wear model...")
+        resp = requests.get(WEAR_MODEL_URL, timeout=60)
+        resp.raise_for_status()
+        with open(wear_model_path, "wb") as f:
+            f.write(resp.content)
+    wear_model = load_model(wear_model_path)
     logger.info("Wear model loaded successfully.")
 except Exception as e:
     logger.warning(f"Wear model load failed: {e}")
     wear_model = None
 
-# Download and load depreciation model
+# Load depreciation model
 try:
     depreciation_model_path = "models/depreciation_model.h5"
-    os.makedirs("models", exist_ok=True)
     if not os.path.exists(depreciation_model_path):
-        logger.info("Downloading depreciation model from Azure Blob...")
+        logger.info("Downloading depreciation model...")
         resp = requests.get(DEPRECIATION_MODEL_URL, timeout=60)
         resp.raise_for_status()
         with open(depreciation_model_path, "wb") as f:
             f.write(resp.content)
-        logger.info("Depreciation model downloaded.")
     depreciation_model = load_model(depreciation_model_path)
     logger.info("Depreciation model loaded successfully.")
 except Exception as e:
@@ -67,7 +74,7 @@ except Exception as e:
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def preprocess_image(image_path, size=(224,224)):
+def preprocess_image(image_path, size=(224, 224)):
     try:
         with Image.open(image_path) as img:
             if img.mode != 'RGB':
@@ -106,7 +113,7 @@ def upload_to_azure(file_path, blob_name):
                 "x-ms-blob-type": "BlockBlob",
                 "Content-Type": "application/octet-stream"
             }
-            blob_url = f"{AZURE_CONTAINER_SAS.split('?')[0]}/{blob_name}?{AZURE_CONTAINER_SAS.split('?')[1]}"
+            blob_url = f"{AZURE_CONTAINER_URL}/{blob_name}?{AZURE_CONTAINER_SAS_TOKEN}"
             resp = requests.put(blob_url, headers=headers, data=f)
             if resp.status_code in (201, 202):
                 return blob_url
@@ -171,24 +178,50 @@ def get_exchange_rate(base, target):
         return None
     return resp.json().get('rates', {}).get(target)
 
-@app.route('/ebay-notify', methods=['POST'])
+@app.route('/ebay-notify', methods=['GET', 'POST'])
 def ebay_notify():
-    try:
-        payload = request.get_json()
-        logger.info(f"eBay Notification: {payload}")
-        return jsonify({'status': 'received'}), 200
-    except Exception as e:
-        logger.error(f"eBay notify error: {e}")
-        return jsonify({'error': 'Notification error'}), 500
+    if request.method == 'GET':
+        challenge_code = request.args.get('challenge_code')
+        if not challenge_code:
+            return "No challenge code provided", 400
+
+        verification_token = EBAY_VERIFICATION_TOKEN
+        endpoint_url = 'https://garmentz-dev.ngrok.app/ebay-notify'
+
+        hash_obj = hashlib.sha256()
+        hash_obj.update(challenge_code.encode('utf-8'))
+        hash_obj.update(verification_token.encode('utf-8'))
+        hash_obj.update(endpoint_url.encode('utf-8'))
+        response_hash = hash_obj.hexdigest()
+
+        return jsonify({'challengeResponse': response_hash}), 200
+
+    elif request.method == 'POST':
+        try:
+            data = request.get_json(force=True)
+            logger.info("Received eBay notification: %s", data)
+            topic = data.get("metadata", {}).get("topic", "")
+            if "INVENTORY" in topic:
+                logger.info("Processing INVENTORY notification")
+            elif "MARKETPLACE_ACCOUNT_DELETION" in topic:
+                logger.info("Processing MARKETPLACE_ACCOUNT_DELETION notification")
+            else:
+                logger.info("Unhandled topic: %s", topic)
+
+            return jsonify({"status": "success"}), 200
+        except Exception as e:
+            logger.exception("Error processing eBay notification")
+            return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
         'status': 'ok',
+        'timestamp': datetime.utcnow().isoformat(),
         'wear_model_loaded': wear_model is not None,
         'depreciation_model_loaded': depreciation_model is not None
     })
 
 if __name__ == '__main__':
-    logger.info("Starting server...")
-    app.run(host='0.0.0.0', port=5050, debug=True)
+    logger.info("Starting Garment Analysis API server...")
+    app.run(host='0.0.0.0', port=80, debug=True)
